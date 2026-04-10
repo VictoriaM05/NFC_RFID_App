@@ -1,0 +1,225 @@
+import serial                     
+import serial.tools.list_ports   
+import time                      
+import csv                       
+import datetime                  
+import tkinter as tk            
+from tkinter import ttk, messagebox, filedialog  
+import threading                 
+import pandas as pd              
+
+# Clase principal del programa
+class NFC_Registrador:
+    def __init__(self):
+        self.root = tk.Tk()  # Crear ventana principal
+        self.root.title("Registrador de Tarjetas NFC - PN532 + ESP32")
+        self.root.geometry("800x600")
+        
+        self.ser = None          # Objeto para comunicación serial
+        self.leyendo = False     # Estado de lectura
+        self.archivo_csv = "tarjetas_registradas.csv"  # Archivo por defecto
+        
+        # Variables para guardar selección del usuario
+        self.puerto_var = tk.StringVar()
+        self.baud_var = tk.StringVar(value="115200")
+        
+        self.crear_interfaz()            # Construir GUI
+        self.cargar_puertos()            # Buscar puertos disponibles
+        self.crear_csv_si_no_existe()    # Crear archivo si no existe
+    
+    # ---------- CREAR INTERFAZ ----------
+    def crear_interfaz(self):
+        config_frame = ttk.LabelFrame(self.root, text="Configuración del Puerto", padding=10)
+        config_frame.pack(fill="x", padx=10, pady=5)
+        
+        ttk.Label(config_frame, text="Puerto COM:").grid(row=0, column=0, sticky="w")
+        
+        # Combo para seleccionar puerto
+        self.puerto_combo = ttk.Combobox(config_frame, textvariable=self.puerto_var, width=15)
+        self.puerto_combo.grid(row=0, column=1, padx=5)
+        
+        # Botón para actualizar lista de puertos
+        ttk.Button(config_frame, text="Actualizar Puertos", command=self.cargar_puertos).grid(row=0, column=2, padx=5)
+        
+        ttk.Label(config_frame, text="Baudrate:").grid(row=1, column=0, sticky="w")
+        ttk.Entry(config_frame, textvariable=self.baud_var, width=15).grid(row=1, column=1, padx=5)
+        
+        # Frame de botones
+        btn_frame = ttk.Frame(self.root)
+        btn_frame.pack(pady=5)
+        
+        # Botón conectar/desconectar
+        self.btn_conectar = ttk.Button(btn_frame, text="Conectar al ESP32", command=self.toggle_conexion)
+        self.btn_conectar.pack(side="left", padx=5)
+        
+        # Botón para elegir archivo CSV
+        ttk.Button(btn_frame, text="Guardar como...", command=self.elegir_archivo).pack(side="left", padx=5)
+        
+        # Botón para abrir archivo en Excel
+        ttk.Button(btn_frame, text="Ver Registro (Excel)", command=self.ver_csv).pack(side="left", padx=5)
+        
+        # Área de texto para mostrar datos
+        log_frame = ttk.LabelFrame(self.root, text="Monitor Serial y Tarjetas Detectadas", padding=10)
+        log_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        self.log_text = tk.Text(log_frame, height=20, state="disabled")
+        
+        # Scroll para el log
+        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        
+        self.log_text.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Estado de conexión
+        self.status_label = ttk.Label(self.root, text="Desconectado", foreground="red")
+        self.status_label.pack(pady=5)
+    
+    # ---------- CREAR CSV SI NO EXISTE ----------
+    def crear_csv_si_no_existe(self):
+        try:
+            with open(self.archivo_csv, 'r'):
+                pass
+        except FileNotFoundError:
+            with open(self.archivo_csv, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                # Encabezados del archivo
+                writer.writerow(["Fecha_Hora", "UID_HEX", "UID_Decimal", "UID_Binario", "Notas"])
+    
+    # ---------- CARGAR PUERTOS DISPONIBLES ----------
+    def cargar_puertos(self):
+        puertos = [p.device for p in serial.tools.list_ports.comports()]
+        self.puerto_combo['values'] = puertos
+        if puertos:
+            self.puerto_var.set(puertos[0])  
+    
+    # ---------- MOSTRAR MENSAJES EN PANTALLA ----------
+    def log(self, mensaje):
+        self.log_text.config(state="normal")
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        self.log_text.insert("end", f"[{timestamp}] {mensaje}\n")
+        self.log_text.see("end")
+        self.log_text.config(state="disabled")
+    
+    # ---------- CONECTAR / DESCONECTAR ----------
+    def toggle_conexion(self):
+        if self.leyendo:
+            self.desconectar()
+        else:
+            self.conectar()
+    
+    def conectar(self):
+        try:
+            puerto = self.puerto_var.get()
+            baud = int(self.baud_var.get())
+            
+            # Abrir puerto serial
+            self.ser = serial.Serial(puerto, baud, timeout=1)
+            time.sleep(2)  # Espera a que el ESP32 reinicie
+            
+            self.leyendo = True
+            self.btn_conectar.config(text="Desconectar")
+            self.status_label.config(text="Conectado - Escaneando tarjetas...", foreground="green")
+            self.log("Conectado al ESP32. Acerca una tarjeta al PN532...")
+            
+            # Hilo para leer datos sin congelar la interfaz
+            threading.Thread(target=self.leer_serial, daemon=True).start()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo conectar:\n{str(e)}")
+    
+    def desconectar(self):
+        self.leyendo = False
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+        self.btn_conectar.config(text="Conectar al ESP32")
+        self.status_label.config(text="Desconectado", foreground="red")
+        self.log("Desconectado")
+    
+    # ---------- LEER DATOS DEL ESP32 ----------
+    def leer_serial(self):
+        while self.leyendo and self.ser.is_open:
+            try:
+                if self.ser.in_waiting:
+                    linea = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                    
+                    if linea:
+                        self.log(linea)  # Mostrar en pantalla
+                        
+                        # Detecta cuando se encontró una tarjeta
+                        if "Tarjeta encontrada" in linea:
+                            time.sleep(0.1)
+                            
+                            uid_hex = ""
+                            uid_dec = ""
+                            uid_bin = ""
+                            
+                            # Leer las siguientes líneas (HEX, DEC, BIN)
+                            for _ in range(10):
+                                if not self.ser.in_waiting:
+                                    time.sleep(0.05)
+                                    continue
+                                
+                                next_line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                                self.log(next_line)
+                                
+                                if "HEX" in next_line.upper():
+                                    uid_hex = next_line.split(":")[-1].strip()
+                                elif "DECIMAL" in next_line:
+                                    uid_dec = next_line.split(":")[-1].strip()
+                                elif "BINARIO" in next_line:
+                                    uid_bin = next_line.split(":")[-1].strip()
+                                    break
+                            
+                            # Guardar datos si se obtuvo el UID
+                            if uid_hex:
+                                self.guardar_tarjeta(uid_hex, uid_dec, uid_bin)
+            except:
+                break
+            time.sleep(0.01)
+    
+    # ---------- GUARDAR TARJETA EN CSV ----------
+    def guardar_tarjeta(self, uid_hex, uid_dec, uid_bin):
+        ahora = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        with open(self.archivo_csv, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([ahora, uid_hex, uid_dec, uid_bin, ""])
+        
+        self.log(f"Tarjeta guardada: {uid_hex}")
+    
+    # ---------- CAMBIAR ARCHIVO ----------
+    def elegir_archivo(self):
+        archivo = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+        if archivo:
+            self.archivo_csv = archivo
+            self.log(f"Archivo cambiado a: {archivo}")
+    
+    # ---------- VER CSV ----------
+    def ver_csv(self):
+        try:
+            import os
+            df = pd.read_csv(self.archivo_csv)
+            
+            # Abrir archivo con Excel
+            os.startfile(self.archivo_csv) if hasattr(os, 'startfile') else print("Archivo:", self.archivo_csv)
+            
+            messagebox.showinfo("Registro", f"Abriendo archivo\nTotal tarjetas: {len(df)}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+    
+    # ---------- EJECUTAR PROGRAMA ----------
+    def run(self):
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.root.mainloop()
+    
+    # ---------- CIERRE SEGURO ----------
+    def on_closing(self):
+        if self.leyendo:
+            self.desconectar()
+        self.root.destroy()
+
+# ---------- INICIO DEL PROGRAMA ----------
+if __name__ == "__main__":
+    app = NFC_Registrador()
+    app.run()
